@@ -7,3 +7,7 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+
+# 本地事件日志与运行数据
+data/*.jsonl
+*.jsonl
