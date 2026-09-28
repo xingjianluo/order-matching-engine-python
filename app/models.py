@@ -37,6 +37,7 @@ class RejectReason(str, Enum):
     ORDER_ALREADY_CANCELLED = "ORDER_ALREADY_CANCELLED"
     CORRUPT_EVENT = "CORRUPT_EVENT"
     OUT_OF_ORDER_EVENT = "OUT_OF_ORDER_EVENT"
+    INVALID_LIMIT = "INVALID_LIMIT"
 
 
 class TradingError(Exception):
@@ -94,3 +95,34 @@ class Account:
     max_position: dict[str, Decimal] = field(default_factory=dict)
     # 单笔订单最大名义额（价*量）
     max_order_notional: Decimal = Decimal("Infinity")
+
+
+@dataclass
+class PositionRiskView:
+    """单品种风险视图（当前值 / 全部在途订单按委托价成交后的预计值）。"""
+    symbol: str
+    position: Decimal                    # 当前净持仓
+    reserved_sell: Decimal               # 在途卖单占用数量
+    available_position: Decimal          # 可卖数量 = position - reserved_sell
+    max_position: Decimal | None         # 该品种净持仓绝对值上限（None 表示不限）
+    projected_position: Decimal          # 在途买卖单全部成交后的净持仓
+    position_limit_breached: bool        # 当前 |position| 是否超限
+    projected_position_limit_breached: bool  # 在途全部成交后是否超限
+
+
+@dataclass
+class AccountRiskSnapshot:
+    """账户组合级风险快照：同一把锁内生成，代表一个一致时点。"""
+    account_id: str
+    cash: Decimal                        # 当前现金
+    reserved_buy_notional: Decimal       # 跨品种全部在途买单占用名义额
+    available_cash: Decimal              # 可用现金 = cash - reserved_buy_notional
+    projected_cash: Decimal              # 在途买单全部成交后的现金
+    positions: dict[str, PositionRiskView]
+    # 单笔名义额上限
+    max_order_notional: Decimal
+    # 超过单笔名义额上限的在途订单（限额收紧后可能出现）
+    order_notional_breaches: list[str] = field(default_factory=list)
+    cash_limit_breached: bool = False            # 当前现金是否为负
+    projected_cash_limit_breached: bool = False  # 在途买单全部成交后现金是否为负
+    any_breach: bool = False                     # 上述任一当前/预计违约标志

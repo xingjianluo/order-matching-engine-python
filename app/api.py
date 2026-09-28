@@ -44,6 +44,12 @@ class DepositRequest(BaseModel):
     cash: str = "0"
 
 
+class AdjustLimitsRequest(BaseModel):
+    # 只携带需要调整的品种；值为 null 表示移除该品种限额
+    max_position: dict[str, str | None] | None = None
+    max_order_notional: str | None = None
+
+
 def _order_json(order) -> dict[str, Any]:
     return {
         "order_id": order.order_id,
@@ -85,6 +91,36 @@ def _account_json(acc) -> dict[str, Any]:
     }
 
 
+def _risk_snapshot_json(snap) -> dict[str, Any]:
+    return {
+        "account_id": snap.account_id,
+        "cash": str(snap.cash),
+        "reserved_buy_notional": str(snap.reserved_buy_notional),
+        "available_cash": str(snap.available_cash),
+        "projected_cash": str(snap.projected_cash),
+        "max_order_notional": str(snap.max_order_notional),
+        "cash_limit_breached": snap.cash_limit_breached,
+        "projected_cash_limit_breached": snap.projected_cash_limit_breached,
+        "order_notional_breaches": list(snap.order_notional_breaches),
+        "any_breach": snap.any_breach,
+        "positions": [
+            {
+                "symbol": v.symbol,
+                "position": str(v.position),
+                "reserved_sell": str(v.reserved_sell),
+                "available_position": str(v.available_position),
+                "max_position": str(v.max_position) if v.max_position is not None
+                else None,
+                "projected_position": str(v.projected_position),
+                "position_limit_breached": v.position_limit_breached,
+                "projected_position_limit_breached":
+                    v.projected_position_limit_breached,
+            }
+            for v in snap.positions.values()
+        ],
+    }
+
+
 def create_app(service: TradingService) -> FastAPI:
     app = FastAPI(title="Local Limit-Order Matching Engine", version="0.1.0")
     app.state.service = service
@@ -106,7 +142,8 @@ def create_app(service: TradingService) -> FastAPI:
         acc = service.open_account(
             req.account_id, cash=Decimal(req.cash),
             max_position=req.max_position,
-            max_order_notional=Decimal(req.max_order_notional))
+            # pydantic 会把 "Infinity" 解析为 float，统一转回 Decimal
+            max_order_notional=Decimal(str(req.max_order_notional)))
         return _account_json(acc)
 
     @app.post("/admin/symbols/{symbol}")
@@ -119,6 +156,15 @@ def create_app(service: TradingService) -> FastAPI:
         service.deposit(req.account_id, symbol=req.symbol,
                         quantity=Decimal(req.quantity), cash=Decimal(req.cash))
         return {"accepted": True}
+
+    @app.post("/admin/accounts/{account_id}/limits")
+    def adjust_limits(account_id: str, req: AdjustLimitsRequest):
+        acc = service.adjust_limits(
+            account_id,
+            max_position=req.max_position,
+            max_order_notional=(Decimal(str(req.max_order_notional))
+                                if req.max_order_notional is not None else None))
+        return _account_json(acc)
 
     @app.post("/orders")
     def submit_order(req: SubmitOrderRequest):
@@ -147,5 +193,9 @@ def create_app(service: TradingService) -> FastAPI:
     @app.get("/accounts/{account_id}")
     def get_account(account_id: str):
         return _account_json(service.get_account(account_id))
+
+    @app.get("/accounts/{account_id}/risk")
+    def account_risk_snapshot(account_id: str):
+        return _risk_snapshot_json(service.risk_snapshot(account_id))
 
     return app

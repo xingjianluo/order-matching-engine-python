@@ -8,14 +8,17 @@
 
 ```
 app/
-  models.py     领域模型：Order / Fill / Account、状态枚举、错误原因
+  models.py     领域模型：Order / Fill / Account、AccountRiskSnapshot 等快照类型、
+                状态枚举、错误原因
   orderbook.py  单品种订单簿：价格优先、时间优先撮合，允许部分成交
-  risk.py       账户级风控：现金、可用持仓、持仓限额、单笔名义额、自成交预检
+  risk.py       组合级风控：跨品种共享资金占用、分品种持仓占用、持仓限额、
+                单笔名义额、自成交预检
   eventlog.py   本地仅追加事件日志（JSONL，append + fsync）
-  service.py    交易服务：编排上述组件，线程安全，含重放与守恒校验
+  service.py    交易服务：编排上述组件，线程安全，含风险快照、动态限额、
+                重放与守恒校验
   api.py        FastAPI 路由与请求/响应模型
 main.py         入口：启动时加载 data/events.jsonl 并重放
-tests/          pytest 测试（撮合 / 并发风控幂等 / 重放恢复 + HTTP 端到端）
+tests/          pytest 测试（撮合 / 组合风险 / 并发风控幂等 / 重放恢复 + HTTP 端到端）
 ```
 
 ## 快速开始
@@ -53,6 +56,16 @@ curl -s localhost:8000/orders/O5
 curl -s localhost:8000/books/BTC
 curl -s localhost:8000/fills?symbol=BTC
 curl -s localhost:8000/accounts/buyer
+
+# 账户组合风险快照（现金/占用/可用、各品种持仓与预计值、限额违约标志）
+curl -s localhost:8000/accounts/buyer/risk
+
+# 运行中调整限额：收紧 BTC 净持仓上限并把单笔名义额上限改为 5000
+curl -s -X POST localhost:8000/admin/accounts/buyer/limits \
+  -H 'Content-Type: application/json' \
+  -d '{"max_position":{"BTC":"50"},"max_order_notional":"5000"}'
+# max_position 中某品种传 null 表示移除该品种限额；max_order_notional 传 "Infinity"
+# 表示不设单笔上限。调整落事件持久化，重启后继续生效。
 ```
 
 ## 撮合规则
@@ -76,25 +89,88 @@ curl -s localhost:8000/accounts/buyer
 `UNKNOWN_SYMBOL` / `INVALID_PRICE` / `INVALID_QUANTITY` / `UNKNOWN_ACCOUNT` /
 `INSUFFICIENT_POSITION` / `INSUFFICIENT_CASH` / `RISK_LIMIT_EXCEEDED` /
 `SELF_TRADE` / `DUPLICATE_IDEMPOTENCY_KEY` / `ORDER_NOT_FOUND` /
-`ORDER_ALREADY_FILLED` / `ORDER_ALREADY_CANCELLED`，
+`ORDER_ALREADY_FILLED` / `ORDER_ALREADY_CANCELLED` / `INVALID_LIMIT`，
 重放阶段另有 `CORRUPT_EVENT` / `OUT_OF_ORDER_EVENT`。
 
-## 风控语义
+## 组合级占用与风控语义
 
 下单在**任何状态变更之前**完成以下校验，被拒绝的请求只落一条带
 `reject_reason` 的 `ORDER_SUBMITTED` 事件，绝不修改订单簿、现金或持仓：
 
-1. 账户、品种存在；价格、数量为正的有限十进制数（全程 `Decimal`，拒绝浮点输入）。
-2. **卖单**：卖出量不得超过“当前持仓 − 已挂卖单占用量”。先区分
-   `INSUFFICIENT_POSITION`（连总持仓都不足）与风控超额；成交/撤单会即时释放占用。
-3. **买单**：委托名义额 `price × quantity` 不得超过“现金 − 已挂买单占用名义额”
-   （`INSUFFICIENT_CASH`）。
-4. **持仓限额**：账户的 `max_position[symbol]` 约束成交后净持仓绝对值；
-   `max_order_notional` 约束单笔订单名义额上限。超限返回 `RISK_LIMIT_EXCEEDED`。
-5. 自成交预检见上节。
+1. 账户、品种存在；价格、数量为正的有限十进制数（全程 `Decimal`，拒绝有限
+   浮点输入）。
+2. **在途买单共享同一份现金（组合级）**：同一账户在**所有品种**上的在途买单，
+   其剩余量按各自委托价折算的名义额之和共同占用账户现金；可用现金
+   `available_cash = cash − Σ(在途买单剩余量 × 委托价)`，不按品种各算一份。
+   新买单名义额超过可用现金即 `INSUFFICIENT_CASH`。
+3. **可用持仓按品种分别计算**：某品种可卖数量
+   `available_position = 当前净持仓 − 该品种全部在途卖单剩余量`。
+   卖出量超过总持仓为 `INSUFFICIENT_POSITION`（与“可用不足但总持仓足够”
+   使用同一原因码，消息中给出区分）。
+4. **持仓限额（组合预计口径）**：校验时把该品种上已有的在途买单与在途卖单
+   一并计入预计净持仓
+   `projected = 当前持仓 + 在途买单剩余量 − 在途卖单剩余量 ± 新单量`，
+   要求 `|projected| ≤ max_position[symbol]`，否则 `RISK_LIMIT_EXCEEDED`。
+   因此跨品种资金、同品种双向挂单都不会被重复计算或漏算。
+5. **单笔名义额**：`price × quantity ≤ max_order_notional`，超限返回
+   `RISK_LIMIT_EXCEEDED`。
+6. 自成交预检见上节。
 
-服务用单一 `RLock` 串行化所有提交/撤单/查询：并发场景下不会出现超卖、
-同一挂单被吃两次、超限订单漏检等问题（见并发测试）。
+**占用释放**：撤单立即释放该单全部占用；拒单从不产生占用；成交按实际成交量
+释放——部分成交时，已成交部分由“在途占用”转为真实的现金扣划/持仓划转，
+仅剩余量继续占用。所有计算都基于订单的**剩余量（remaining）**，
+因此不存在“已成交部分仍被占用”的重复占用。
+
+服务用单一 `RLock` 串行化所有提交/撤单/快照查询，且撤单的内存移除与事件落盘
+对外部原子可见（落盘失败会回滚内存）：并发下单、撤单、成交交错时，
+同一笔资金或同一批可用持仓不会被重复占用，快照也读不到中间态。
+
+## 账户风险快照
+
+`GET /accounts/{account_id}/risk`（或 `TradingService.risk_snapshot()`）在
+**同一把锁内一次性汇总**订单簿与账户状态，返回与最终状态一致的组合视图，
+不会与订单簿/账户出现半拍偏差。字段含义：
+
+账户级：
+
+| 字段 | 含义 |
+| --- | --- |
+| `cash` | 当前现金（已成交部分已扣划） |
+| `reserved_buy_notional` | 跨**所有品种**在途买单的名义额占用合计 |
+| `available_cash` | 可用现金 = `cash − reserved_buy_notional` |
+| `projected_cash` | 所有在途买单按各自委托价全部成交后的现金（= `available_cash`） |
+| `max_order_notional` | 单笔名义额上限 |
+| `order_notional_breaches` | 当前名义额超过单笔上限的在途订单 id（限额收紧后可能出现） |
+| `cash_limit_breached` / `projected_cash_limit_breached` | 当前/在途全成交后现金是否为负 |
+| `any_breach` | 下列任一当前或预计违约标志为真 |
+
+各品种（`positions[]`，覆盖全部已注册品种及有持仓/挂单/限额的品种）：
+
+| 字段 | 含义 |
+| --- | --- |
+| `position` | 当前净持仓（买正卖负） |
+| `reserved_sell` | 该品种在途卖单占用的数量 |
+| `available_position` | 可卖数量 = `position − reserved_sell` |
+| `max_position` | 该品种净持仓绝对值上限，`null` 表示不限 |
+| `projected_position` | 该品种在途买卖单全部成交后的净持仓 |
+| `position_limit_breached` | 当前 `|position|` 是否已超限 |
+| `projected_position_limit_breached` | 在途订单全部成交后是否超限 |
+
+## 动态限额及其生效边界
+
+`POST /admin/accounts/{account_id}/limits`（或 `TradingService.adjust_limits()`）
+可在运行中调整各品种 `max_position` 与 `max_order_notional`：
+
+- 调整作为一条 `LIMITS_ADJUSTED` 事件持久化（落的是合并后的**完整**限额快照），
+  **服务重启重放后继续生效**。非法限额（负数、零、NaN）返回 `INVALID_LIMIT`。
+- **只影响边界，不追溯存量**：收紧限额**不会强制取消**任何已有在途订单，
+  也不立即回滚已成交持仓；但：
+  - 后续**新订单**立即按新限额预检，超限整单拒绝且零副作用；
+  - 风险快照通过 `projected_position_limit_breached`、
+    `order_notional_breaches` 等字段，明确标出已有在途订单全部成交后是否会超限，
+    以及哪些存量挂单已超过新的单笔名义额上限。
+- 限额调整与下单、撤单、成交在同一把锁上串行，任一时点不会出现同一笔资金或
+  同一批可用持仓被重复占用。
 
 ## 幂等语义
 
@@ -115,11 +191,21 @@ HTTP 状态码约定：下单被业务规则拒绝时返回 **200**，响应体
 
 所有状态变更只通过追加事件完成，事件类型：
 `ACCOUNT_OPENED` / `SYMBOL_REGISTERED` / `DEPOSIT` /
-`ORDER_SUBMITTED`（含 `reject_reason`）/ `FILL` / `ORDER_CANCELLED`。
+`ORDER_SUBMITTED`（含 `reject_reason`）/ `FILL` / `ORDER_CANCELLED` /
+`LIMITS_ADJUSTED`（运行中限额调整，载荷为合并后的完整 `max_position` 与
+`max_order_notional`）。
 
 写入协议（崩溃一致性）：**先把完整事件序列（提交事件及其全部成交事件）
 fsync 落盘，再更新内存状态**。因此不会出现“内存已成交而日志缺失”的幻影成交；
-极端情况下崩溃在落盘之后、更新内存之前，重启重放会补上该笔成交。
+极端情况下崩溃在落盘之后、更新内存之前，重启重放会补上该笔成交。撤单则相反，
+先在锁内完成内存移除（对外部读原子可见），落盘失败时回滚内存，
+不会对外确认一笔未持久化的撤单。
+
+**与既有事件重放的兼容范围**：`LIMITS_ADJUSTED` 是纯增量事件类型，
+旧日志（不含该事件）可原样重放，账户沿用 `ACCOUNT_OPENED` 上的初始限额；
+新日志中的限额调整按事件顺序覆盖，重放结果与停机前逐字段一致
+（包括风险快照中的占用、预计值与违约标志，见
+`tests/test_risk_portfolio.py`）。
 
 重放在启动时自动执行（`TradingService.replay()`），并做严格校验，
 **任何不一致都明确抛错，绝不静默跳过或覆盖已有状态**：
@@ -130,6 +216,8 @@ fsync 落盘，再更新内存状态**。因此不会出现“内存已成交而
   成交量为正且累计不超委托量；成交/撤单事件必须严格晚于对应订单的提交事件，
   且发生时订单仍在订单簿中 => `CORRUPT_EVENT` / `OUT_OF_ORDER_EVENT`。
 - JSON 行损坏或缺必填字段 => `CORRUPT_EVENT`；未知事件类型同样拒绝。
+- `LIMITS_ADJUSTED` 必须引用已存在账户，品种限额为非负有限十进制，
+  单笔名义额为正数或 `Infinity`，否则 => `CORRUPT_EVENT`。
 - 重放结束后执行守恒断言：成交序列与事件流逐条一致、每单累计成交量与订单
   `filled_qty` 相等、被拒单零成交、全系统现金守恒、各品种净持仓等于累计入券量。
 
@@ -139,13 +227,23 @@ fsync 落盘，再更新内存状态**。因此不会出现“内存已成交而
 ## 本地验证
 
 ```bash
-uv run pytest -q                 # 全部 29 个用例
+uv run pytest -q                 # 全部 39 个用例
+uv run pytest tests/test_risk_portfolio.py -q   # 仅本轮组合风险相关用例
 ```
 
-测试分三组，且通过日志（stdout/stderr）打印**输入参数、关键状态快照与判定依据**：
+测试分四组，且通过日志（stdout/stderr）打印**输入参数、关键状态快照与判定依据**：
 
 - `tests/test_matching.py`：全部/部分成交、价格-时间优先、不成交挂单、
   撤单与重复撤单、自成交、资金/持仓不足、非法输入与守恒断言。
+- `tests/test_risk_portfolio.py`（本轮新增）：
+  - 同一账户跨品种在途买单共享同一份现金（超池拒绝、被拒零副作用）；
+  - 同品种在途卖单共同占用可用持仓、不同品种互不影响；
+  - 运行中收紧持仓限额/单笔名义额：存量单不撤、快照标出预计违约、
+    后续新单被整单拒绝且订单簿/成交/账户零副作用；
+  - 撤单与部分成交只释放对应占用（已成交部分转为真实划转，剩余继续占用）；
+  - 16 线程并发下单 + 并发撤单交错下快照恒等式成立、现金池不超额订阅；
+  - 跨“进程”重启重放后风险快照、订单簿、成交、限额调整逐字段一致，
+    并经 FastAPI TestClient 验证新 HTTP 端点的持久化。
 - `tests/test_concurrency.py`：16 线程下撤单与成交竞争（只允许一方生效）、
   100 个并发买单不得超卖 10 的挂量、同一幂等键 50 并发只成交一次、
   持仓限额拒绝的零副作用、混合 300 次读写无内部错误。
