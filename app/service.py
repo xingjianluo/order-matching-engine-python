@@ -18,11 +18,13 @@ from typing import Any
 from app.eventlog import EventLog
 from app.models import (
     Account,
+    AccountRiskSnapshot,
     Fill,
     Order,
     OrderStatus,
     RejectReason,
     Side,
+    SymbolRiskSnapshot,
     TradingError,
 )
 from app.orderbook import OrderBook
@@ -114,6 +116,59 @@ class TradingService:
                 acc.positions[symbol] = acc.positions.get(symbol, ZERO) + qty_d
             logger.info("deposit acct=%s symbol=%s qty=%s cash=%s",
                         account_id, symbol, qty_d, cash_d)
+
+    def adjust_limits(self, account_id: str,
+                      max_position: dict[str, Any] | None = None,
+                      max_order_notional: Any | None = None,
+                      reset_positions: bool = False) -> Account:
+        """运行中调整账户持仓限额与单笔名义额上限（先持久化、再生效）。
+
+        - ``max_position``：按品种合并覆盖；``reset_positions=True`` 时整体替换，
+          未列出的品种限额被移除（即不再限仓）。
+        - ``max_order_notional``：仅在传入时覆盖单笔名义额上限。
+        收紧限额不强制取消在途订单，只影响后续新单准入；风险快照会标出
+        在途订单全部成交后的超限品种与已超过新单笔上限的在途订单。
+        """
+        with self._lock:
+            acc = self._accounts.get(account_id)
+            if acc is None:
+                raise TradingError(RejectReason.UNKNOWN_ACCOUNT,
+                                   f"account {account_id} not found")
+            new_positions = (
+                {s: D(v) for s, v in (max_position or {}).items()}
+                if max_position is not None else None)
+            new_notional = D(max_order_notional) \
+                if max_order_notional is not None else None
+            if new_positions is not None:
+                for sym, v in new_positions.items():
+                    if v.is_nan() or v < 0:
+                        raise TradingError(RejectReason.INVALID_QUANTITY,
+                                           f"limit for {sym} must be >= 0")
+            if new_notional is not None and (
+                    new_notional.is_nan() or new_notional < 0):
+                raise TradingError(RejectReason.INVALID_PRICE,
+                                   "max_order_notional must be >= 0")
+
+            event = self._persist({
+                "type": "LIMITS_ADJUSTED",
+                "account_id": account_id,
+                "max_position": ({s: str(v) for s, v in new_positions.items()}
+                                 if new_positions is not None else None),
+                "max_order_notional": (str(new_notional)
+                                       if new_notional is not None else None),
+                "reset_positions": bool(reset_positions),
+            })
+            if new_positions is not None:
+                acc.max_position = (dict(new_positions) if reset_positions
+                                    else {**acc.max_position, **new_positions})
+            if new_notional is not None:
+                acc.max_order_notional = new_notional
+            logger.info(
+                "limits adjusted seq=%s acct=%s positions=%s notional=%s",
+                event["seq"], account_id,
+                {s: str(v) for s, v in acc.max_position.items()},
+                acc.max_order_notional)
+            return acc
 
     # ============ 下单 ============
     def submit_order(self, client_order_id: str, symbol: str, side: str | Side,
@@ -232,17 +287,24 @@ class TradingService:
         return order
 
     def _precheck_locked(self, acc: Account, order: Order) -> RejectReason | None:
-        reserved_sell = ZERO
+        reserved_sell_qty = ZERO
         reserved_buy_notional = ZERO
+        resting_buy_qty = ZERO
         for active in self._active.values():
             if active.account != acc.account_id:
                 continue
-            if active.side == Side.SELL and active.symbol == order.symbol:
-                reserved_sell += active.remaining
-            elif active.side == Side.BUY and active.symbol == order.symbol:
+            if active.side == Side.SELL:
+                if active.symbol == order.symbol:
+                    reserved_sell_qty += active.remaining
+            else:
+                # 跨品种共享现金：所有品种在途买单名义额一起占用
                 reserved_buy_notional += active.remaining * active.price
+                if active.symbol == order.symbol:
+                    resting_buy_qty += active.remaining
         try:
-            self._risk.check_order(acc, order, reserved_sell, reserved_buy_notional)
+            self._risk.check_order(
+                acc, order, reserved_sell_qty,
+                reserved_buy_notional, resting_buy_qty)
         except TradingError as exc:
             logger.info("risk reject order-coid=%s reason=%s",
                         order.client_order_id, exc.reason.value)
@@ -320,6 +382,80 @@ class TradingService:
                 raise TradingError(RejectReason.UNKNOWN_ACCOUNT,
                                    f"account {account_id} not found")
             return acc
+
+    def risk_snapshot(self, account_id: str) -> AccountRiskSnapshot:
+        """返回组合级风险快照。
+
+        全部汇总在与下单/撤单/成交相同的 RLock 内基于最终态完成，
+        快照中各字段严格对应同一串行化时点，绝不呈现中间态或重复占用。
+        """
+        with self._lock:
+            acc = self._accounts.get(account_id)
+            if acc is None:
+                raise TradingError(RejectReason.UNKNOWN_ACCOUNT,
+                                   f"account {account_id} not found")
+
+            reserved_buy_notional = ZERO
+            projected_cash = acc.cash
+            per_sell: dict[str, Decimal] = {}
+            per_buy_qty: dict[str, Decimal] = {}
+            over_capped: list[str] = []
+            for active in self._active.values():
+                if active.account != account_id:
+                    continue
+                notional = active.remaining * active.price
+                if active.side == Side.BUY:
+                    reserved_buy_notional += notional
+                    per_buy_qty[active.symbol] = (
+                        per_buy_qty.get(active.symbol, ZERO) + active.remaining)
+                    projected_cash -= notional
+                else:
+                    per_sell[active.symbol] = (
+                        per_sell.get(active.symbol, ZERO) + active.remaining)
+                    projected_cash += notional
+                if notional > acc.max_order_notional:
+                    over_capped.append(active.order_id)
+
+            symbols: dict[str, SymbolRiskSnapshot] = {}
+            all_symbols = (set(acc.positions) | set(acc.max_position)
+                           | set(per_sell) | set(per_buy_qty))
+            for symbol in sorted(all_symbols):
+                position = acc.positions.get(symbol, ZERO)
+                reserved_sell = per_sell.get(symbol, ZERO)
+                resting_buy = per_buy_qty.get(symbol, ZERO)
+                projected_position = position + resting_buy - reserved_sell
+                limit = acc.max_position.get(symbol)
+                symbols[symbol] = SymbolRiskSnapshot(
+                    symbol=symbol,
+                    position=position,
+                    reserved_sell=reserved_sell,
+                    available_position=position - reserved_sell,
+                    resting_buy_qty=resting_buy,
+                    projected_position=projected_position,
+                    max_position=limit,
+                    limit_breached=(limit is not None
+                                    and abs(position) > limit),
+                    projected_limit_breached=(limit is not None
+                                              and abs(projected_position) > limit),
+                )
+
+            current_breached = any(s.limit_breached for s in symbols.values())
+            projected_breached = any(
+                s.projected_limit_breached for s in symbols.values())
+            return AccountRiskSnapshot(
+                account_id=account_id,
+                cash=acc.cash,
+                reserved_buy_notional=reserved_buy_notional,
+                available_cash=acc.cash - reserved_buy_notional,
+                max_order_notional=acc.max_order_notional,
+                projected_cash=projected_cash,
+                cash_breached=acc.cash < 0,
+                projected_cash_breached=projected_cash < 0,
+                current_limit_breached=current_breached,
+                projected_limit_breached=projected_breached,
+                over_capped_orders=sorted(over_capped),
+                symbols=symbols,
+            )
 
     def list_symbols(self) -> list[str]:
         with self._lock:
@@ -423,6 +559,8 @@ class TradingService:
                     self._replay_account(event)
                 elif etype == "DEPOSIT":
                     deposits_cash += self._replay_deposit(event, deposits_qty)
+                elif etype == "LIMITS_ADJUSTED":
+                    self._replay_limits(event)
                 elif etype == "ORDER_SUBMITTED":
                     self._replay_order(event, submitted, submit_seq, filled_qty)
                 elif etype == "FILL":
@@ -489,6 +627,43 @@ class TradingService:
             acc.positions[symbol] = acc.positions.get(symbol, ZERO) + qty
             deposits_qty[symbol] = deposits_qty.get(symbol, ZERO) + qty
         return cash
+
+    def _replay_limits(self, event: dict) -> None:
+        seq = event["seq"]
+        account_id = self._require_str(event, "account_id")
+        if account_id not in self._accounts:
+            raise TradingError(RejectReason.CORRUPT_EVENT,
+                               f"seq={seq} limits on unknown account")
+        raw_positions = event.get("max_position")
+        raw_notional = event.get("max_order_notional")
+        reset = event.get("reset_positions", False)
+        if not isinstance(reset, bool):
+            raise TradingError(RejectReason.CORRUPT_EVENT,
+                               f"seq={seq} reset_positions must be bool")
+        try:
+            new_positions = (
+                {s: D(v) for s, v in raw_positions.items()}
+                if raw_positions is not None else None)
+            new_notional = D(raw_notional) if raw_notional is not None else None
+        except (AttributeError, InvalidOperation, TypeError) as exc:
+            raise TradingError(
+                RejectReason.CORRUPT_EVENT,
+                f"seq={seq} bad limits payload: {exc}") from exc
+        acc = self._accounts[account_id]
+        if new_positions is not None:
+            for sym, v in new_positions.items():
+                if not isinstance(sym, str) or v.is_nan() or v < 0:
+                    raise TradingError(
+                        RejectReason.CORRUPT_EVENT,
+                        f"seq={seq} bad position limit {sym}={v}")
+            acc.max_position = (dict(new_positions) if reset
+                                else {**acc.max_position, **new_positions})
+        if new_notional is not None:
+            if new_notional.is_nan() or new_notional < 0:
+                raise TradingError(RejectReason.CORRUPT_EVENT,
+                                   f"seq={seq} bad notional limit")
+            acc.max_order_notional = new_notional
+        logger.info("replay limits seq=%s acct=%s", seq, account_id)
 
     def _replay_order(self, event: dict, submitted: set[str],
                       submit_seq: dict[str, int],

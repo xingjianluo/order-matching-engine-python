@@ -94,3 +94,57 @@ class Account:
     max_position: dict[str, Decimal] = field(default_factory=dict)
     # 单笔订单最大名义额（价*量）
     max_order_notional: Decimal = Decimal("Infinity")
+
+
+@dataclass
+class SymbolRiskSnapshot:
+    """单品种风险占用视图（同一账户视角）。
+
+    - position：当前净持仓（买正卖负）。
+    - reserved_sell：该品种全部在途卖单的剩余数量合计（占用可卖持仓）。
+    - available_position：当前持仓 - 在途卖单占用，即可再卖数量。
+    - resting_buy_qty：该品种全部在途买单剩余数量合计（用于预估成交后持仓）。
+    - projected_position：在途买卖单全部成交后的预估净持仓
+      （= position + resting_buy_qty - reserved_sell，同账户买卖不会互相对手）。
+    - max_position：当前生效的持仓限额（无配置为 None）。
+    - limit_breached / projected_limit_breached：当前/预估是否已严格超限。
+    """
+
+    symbol: str
+    position: Decimal
+    reserved_sell: Decimal
+    available_position: Decimal
+    resting_buy_qty: Decimal
+    projected_position: Decimal
+    max_position: Decimal | None
+    limit_breached: bool
+    projected_limit_breached: bool
+
+
+@dataclass
+class AccountRiskSnapshot:
+    """账户组合级风险快照：跨品种共享现金、按品种分列持仓占用。
+
+    - reserved_buy_notional：全部品种在途买单剩余名义额合计，统一占用现金。
+    - available_cash：cash - reserved_buy_notional，即新买单真正还能用的现金。
+    - projected_cash：在途买卖单全部成交后的预估现金
+      （买单花掉 remaining*price、卖单收入 remaining*price）。
+    - cash_breached：当前现金是否已为负（正常风控下不应出现，仅作观测）。
+    - projected_cash_breached：预估成交后现金是否为负（正常风控下不应出现）。
+    - projected_limit_breached / current_limit_breached：任一品种预估/当前超限。
+    - over_capped_orders：名义额已超过当前单笔上限的在途订单
+      （收紧限额后用于提示，不强制撤单）。
+    """
+
+    account_id: str
+    cash: Decimal
+    reserved_buy_notional: Decimal
+    available_cash: Decimal
+    max_order_notional: Decimal
+    projected_cash: Decimal
+    cash_breached: bool
+    projected_cash_breached: bool
+    current_limit_breached: bool
+    projected_limit_breached: bool
+    over_capped_orders: list[str] = field(default_factory=list)
+    symbols: dict[str, SymbolRiskSnapshot] = field(default_factory=dict)

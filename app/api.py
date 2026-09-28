@@ -44,6 +44,13 @@ class DepositRequest(BaseModel):
     cash: str = "0"
 
 
+class AdjustLimitsRequest(BaseModel):
+    account_id: str = Field(min_length=1)
+    max_position: dict[str, str] | None = None
+    max_order_notional: str | None = None
+    reset_positions: bool = False
+
+
 def _order_json(order) -> dict[str, Any]:
     return {
         "order_id": order.order_id,
@@ -85,6 +92,39 @@ def _account_json(acc) -> dict[str, Any]:
     }
 
 
+def _symbol_risk_json(row) -> dict[str, Any]:
+    return {
+        "symbol": row.symbol,
+        "position": str(row.position),
+        "reserved_sell": str(row.reserved_sell),
+        "available_position": str(row.available_position),
+        "resting_buy_qty": str(row.resting_buy_qty),
+        "projected_position": str(row.projected_position),
+        "max_position": (str(row.max_position)
+                         if row.max_position is not None else None),
+        "limit_breached": row.limit_breached,
+        "projected_limit_breached": row.projected_limit_breached,
+    }
+
+
+def _risk_snapshot_json(snap) -> dict[str, Any]:
+    return {
+        "account_id": snap.account_id,
+        "cash": str(snap.cash),
+        "reserved_buy_notional": str(snap.reserved_buy_notional),
+        "available_cash": str(snap.available_cash),
+        "max_order_notional": str(snap.max_order_notional),
+        "projected_cash": str(snap.projected_cash),
+        "cash_breached": snap.cash_breached,
+        "projected_cash_breached": snap.projected_cash_breached,
+        "current_limit_breached": snap.current_limit_breached,
+        "projected_limit_breached": snap.projected_limit_breached,
+        "over_capped_orders": snap.over_capped_orders,
+        "symbols": {s: _symbol_risk_json(row)
+                    for s, row in sorted(snap.symbols.items())},
+    }
+
+
 def create_app(service: TradingService) -> FastAPI:
     app = FastAPI(title="Local Limit-Order Matching Engine", version="0.1.0")
     app.state.service = service
@@ -120,6 +160,16 @@ def create_app(service: TradingService) -> FastAPI:
                         quantity=Decimal(req.quantity), cash=Decimal(req.cash))
         return {"accepted": True}
 
+    @app.post("/admin/limits")
+    def adjust_limits(req: AdjustLimitsRequest):
+        acc = service.adjust_limits(
+            req.account_id,
+            max_position=req.max_position,
+            max_order_notional=(Decimal(req.max_order_notional)
+                                if req.max_order_notional is not None else None),
+            reset_positions=req.reset_positions)
+        return _account_json(acc)
+
     @app.post("/orders")
     def submit_order(req: SubmitOrderRequest):
         order = service.submit_order(
@@ -147,5 +197,9 @@ def create_app(service: TradingService) -> FastAPI:
     @app.get("/accounts/{account_id}")
     def get_account(account_id: str):
         return _account_json(service.get_account(account_id))
+
+    @app.get("/accounts/{account_id}/risk")
+    def account_risk(account_id: str):
+        return _risk_snapshot_json(service.risk_snapshot(account_id))
 
     return app

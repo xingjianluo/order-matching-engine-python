@@ -1,9 +1,12 @@
-"""账户级风控：持仓限额、可用持仓/资金与单笔名义额校验。
+"""账户组合级风控：现金/持仓占用、持仓限额与单笔名义额校验。
 
-约定（由服务层在调用前汇总）：
-- ``reserved_sell``：该账户在该品种上已挂卖单占用的数量；
-- ``reserved_buy_notional``：该账户在该品种上已挂买单占用的名义额；
-  可用 = 当前持仓 - reserved_sell；可用资金 = cash - 全部已挂买单占用名义额。
+占用口径（由服务层在调用前从全部在途订单汇总）：
+- ``reserved_sell_qty``：该账户在**该品种**上全部在途卖单的剩余数量合计，
+  按品种分别占用可卖持仓；可用持仓 = 当前持仓 - reserved_sell_qty。
+- ``reserved_buy_notional``：该账户在**全部品种**上在途买单剩余名义额合计，
+  跨品种统一占用同一份现金；可用现金 = cash - reserved_buy_notional。
+- ``resting_buy_qty``：该品种全部在途买单剩余数量合计，仅用于限额预估。
+持仓限额按“该品种在途买卖单全部成交后的预估净持仓”判定；
 风控只做判定，不修改状态，保证拒绝不产生副作用。
 """
 from __future__ import annotations
@@ -18,16 +21,17 @@ class RiskManager:
         self,
         account: Account,
         order: Order,
-        reserved_sell: Decimal,
+        reserved_sell_qty: Decimal,
         reserved_buy_notional: Decimal,
+        resting_buy_qty: Decimal,
     ) -> None:
         notional = order.price * order.quantity
         limit = account.max_position.get(order.symbol)
+        position = account.positions.get(order.symbol, Decimal(0))
 
         if order.side == Side.SELL:
-            position = account.positions.get(order.symbol, Decimal(0))
-            available = position - reserved_sell
-            # 先区分：连持仓都不足 vs 超过风控限额
+            available = position - reserved_sell_qty
+            # 先区分：连总持仓都不足 vs 可用（扣除在途卖单）不足
             if order.quantity > position:
                 raise TradingError(
                     RejectReason.INSUFFICIENT_POSITION,
@@ -38,28 +42,35 @@ class RiskManager:
                 raise TradingError(
                     RejectReason.INSUFFICIENT_POSITION,
                     f"sell qty {order.quantity} exceeds available {available} "
-                    f"(position minus {reserved_sell} reserved)",
+                    f"(position {position} minus {reserved_sell_qty} reserved)",
                 )
-            projected = abs(position - order.quantity)
+            # 该品种在途买卖单全部成交后，净持仓的预估值
+            projected = abs(
+                position + resting_buy_qty
+                - reserved_sell_qty - order.quantity
+            )
             if limit is not None and projected > limit:
                 raise TradingError(
                     RejectReason.RISK_LIMIT_EXCEEDED,
-                    f"projected short exposure {projected} exceeds limit {limit}",
+                    f"projected net position {projected} exceeds limit {limit}",
                 )
         else:
+            # 跨品种共享现金：扣减全部品种在途买单占用
             available_cash = account.cash - reserved_buy_notional
             if notional > available_cash:
                 raise TradingError(
                     RejectReason.INSUFFICIENT_CASH,
                     f"buy notional {notional} exceeds available cash "
                     f"{available_cash} (cash {account.cash} reserved "
-                    f"{reserved_buy_notional})")
-            position = account.positions.get(order.symbol, Decimal(0))
-            projected = abs(position + order.quantity)
+                    f"{reserved_buy_notional} across all symbols)")
+            projected = abs(
+                position + resting_buy_qty + order.quantity
+                - reserved_sell_qty
+            )
             if limit is not None and projected > limit:
                 raise TradingError(
                     RejectReason.RISK_LIMIT_EXCEEDED,
-                    f"projected position {projected} exceeds limit {limit}")
+                    f"projected net position {projected} exceeds limit {limit}")
 
         if notional > account.max_order_notional:
             raise TradingError(
