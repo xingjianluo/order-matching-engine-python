@@ -96,6 +96,7 @@ def _risk_snapshot_json(snap) -> dict[str, Any]:
         "account_id": snap.account_id,
         "cash": str(snap.cash),
         "reserved_buy_notional": str(snap.reserved_buy_notional),
+        "reserved_sell_notional": str(snap.reserved_sell_notional),
         "available_cash": str(snap.available_cash),
         "projected_cash": str(snap.projected_cash),
         "max_order_notional": str(snap.max_order_notional),

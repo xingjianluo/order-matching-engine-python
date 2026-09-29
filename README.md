@@ -119,7 +119,8 @@ curl -s -X POST localhost:8000/admin/accounts/buyer/limits \
 **占用释放**：撤单立即释放该单全部占用；拒单从不产生占用；成交按实际成交量
 释放——部分成交时，已成交部分由“在途占用”转为真实的现金扣划/持仓划转，
 仅剩余量继续占用。所有计算都基于订单的**剩余量（remaining）**，
-因此不存在“已成交部分仍被占用”的重复占用。
+因此不存在“已成交部分仍被占用”的重复占用。由于预计现金与预计持仓都只汇总
+在途订单的**剩余量**，部分成交、撤单、拒单后两者始终与订单簿/账户真实状态同步。
 
 服务用单一 `RLock` 串行化所有提交/撤单/快照查询，且撤单的内存移除与事件落盘
 对外部原子可见（落盘失败会回滚内存）：并发下单、撤单、成交交错时，
@@ -137,12 +138,19 @@ curl -s -X POST localhost:8000/admin/accounts/buyer/limits \
 | --- | --- |
 | `cash` | 当前现金（已成交部分已扣划） |
 | `reserved_buy_notional` | 跨**所有品种**在途买单的名义额占用合计 |
-| `available_cash` | 可用现金 = `cash − reserved_buy_notional` |
-| `projected_cash` | 所有在途买单按各自委托价全部成交后的现金（= `available_cash`） |
+| `reserved_sell_notional` | 跨**所有品种**在途卖单按委托价全部成交预计回笼的名义额合计 |
+| `available_cash` | 可用现金 = `cash − reserved_buy_notional`（下单预检口径，只扣买单支出） |
+| `projected_cash` | **所有在途买单与卖单全部成交后**的现金 = `cash − reserved_buy_notional + reserved_sell_notional` |
 | `max_order_notional` | 单笔名义额上限 |
 | `order_notional_breaches` | 当前名义额超过单笔上限的在途订单 id（限额收紧后可能出现） |
-| `cash_limit_breached` / `projected_cash_limit_breached` | 当前/在途全成交后现金是否为负 |
+| `cash_limit_breached` / `projected_cash_limit_breached` | 当前现金是否为负 / 所有在途买卖单全部成交后现金是否为负 |
 | `any_breach` | 下列任一当前或预计违约标志为真 |
+
+> **`projected_cash` 与 `projected_position` 同口径**：两者都表示“该账户所有
+> 在途订单按各自委托价全部成交之后”的结果。在途卖单成交会减少持仓、同时
+> 收进现金，因此 `projected_cash` 必须在减去在途买单支出的同时**加上在途卖单
+> 收入**，与 `projected_position = position + 在途买单量 − 在途卖单量` 保持一致；
+> 不能只减买单而漏掉卖单收入。
 
 各品种（`positions[]`，覆盖全部已注册品种及有持仓/挂单/限额的品种）：
 
@@ -227,8 +235,8 @@ fsync 落盘，再更新内存状态**。因此不会出现“内存已成交而
 ## 本地验证
 
 ```bash
-uv run pytest -q                 # 全部 39 个用例
-uv run pytest tests/test_risk_portfolio.py -q   # 仅本轮组合风险相关用例
+uv run pytest -q                 # 全部 44 个用例
+uv run pytest tests/test_risk_portfolio.py -q   # 仅组合风险/快照口径用例
 ```
 
 测试分四组，且通过日志（stdout/stderr）打印**输入参数、关键状态快照与判定依据**：
@@ -241,9 +249,15 @@ uv run pytest tests/test_risk_portfolio.py -q   # 仅本轮组合风险相关用
   - 运行中收紧持仓限额/单笔名义额：存量单不撤、快照标出预计违约、
     后续新单被整单拒绝且订单簿/成交/账户零副作用；
   - 撤单与部分成交只释放对应占用（已成交部分转为真实划转，剩余继续占用）；
-  - 16 线程并发下单 + 并发撤单交错下快照恒等式成立、现金池不超额订阅；
-  - 跨“进程”重启重放后风险快照、订单簿、成交、限额调整逐字段一致，
-    并经 FastAPI TestClient 验证新 HTTP 端点的持久化。
+  - **预计现金与预计持仓同口径**：同一账户同时存在在途买单与卖单时
+    `projected_cash = cash − 买单支出 + 卖单收入`，覆盖部分成交、撤单、
+    拒单以及预计现金为负时的违约标志，不会因预计值偏小而漏报/误报；
+  - 16 线程并发下单（买卖双向、跨 BTC/ETH）+ 并发撤单 + 运行中收紧限额
+    交错下，独立重算的在途占用与快照各字段逐字段一致（无中间态、无重复占用）；
+  - 16 线程混合下单 + 并发撤单交错下快照恒等式成立、现金池不超额订阅；
+  - 跨“进程”重启重放后风险快照（含 `reserved_sell_notional`、预计值与
+    违约标志）、订单簿、成交、限额调整逐字段一致，
+    并经 FastAPI TestClient 验证新 HTTP 端点的端到端持久化。
 - `tests/test_concurrency.py`：16 线程下撤单与成交竞争（只允许一方生效）、
   100 个并发买单不得超卖 10 的挂量、同一幂等键 50 并发只成交一次、
   持仓限额拒绝的零副作用、混合 300 次读写无内部错误。
@@ -257,3 +271,38 @@ uv run pytest tests/test_risk_portfolio.py -q   # 仅本轮组合风险相关用
 ```bash
 cat data/events.jsonl | python3 -m json.tool
 ```
+
+### 手工复现“预计现金/预计持仓同口径”
+
+下面的最小脚本复现同一账户同时持有在途买单与卖单时的快照口径
+（`uv run python` 在项目根目录执行）：
+
+```python
+from app.service import TradingService
+from app.models import Side
+
+svc = TradingService()                       # 纯内存；传 EventLog 即落盘
+svc.open_account("trader", cash="500")
+svc.register_symbol("BTC")
+svc.deposit("trader", symbol="BTC", quantity="10")
+svc.submit_order("b1", "BTC", Side.BUY,  "100", "4", "trader")  # 支出 400
+svc.submit_order("s1", "BTC", Side.SELL, "120", "3", "trader")  # 收入 360
+
+snap = svc.risk_snapshot("trader")
+btc = snap.positions["BTC"]
+print(snap.cash, snap.reserved_buy_notional, snap.reserved_sell_notional,
+      snap.available_cash, snap.projected_cash)
+# 500 400 360 100 460  ← 460 = 500 - 400 + 360（在途卖单收入必须加回来）
+print(btc.position, btc.projected_position)
+# 10 11               ← 11 = 10 + 4 - 3（与预计现金同一“全部成交后”口径）
+assert snap.projected_cash == snap.cash - snap.reserved_buy_notional \
+    + snap.reserved_sell_notional
+assert btc.projected_position == btc.position + 4 - 3
+```
+
+要点：`available_cash=100` 是下单预检口径（只扣在途买单支出）；
+`projected_cash=460` 是“所有在途买卖单全部成交后”的口径（再加卖单收入），
+与 `projected_position=11` 一致。部分成交、撤单、拒单后二者都会按订单
+剩余量自动更新；并发场景与重启重放后的一致性分别由
+`test_concurrent_mixed_buys_and_sells_snapshot_consistency` 与
+`test_portfolio_state_identical_after_restart` 守护。
