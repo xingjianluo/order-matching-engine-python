@@ -170,6 +170,115 @@ def test_snapshot_reports_projective_breach_after_position_tighten(multi):
     assert snap.available_cash == 700
 
 
+# ============ 预计现金口径：在途卖单成交回款必须计入 ============
+@pytest.fixture
+def dual():
+    """双向挂单账户：trader 现金 2000、BTC 持仓 50；counter 用于对手成交。"""
+    from app.service import TradingService
+    s = TradingService()
+    s.open_account("trader", cash="2000",
+                   max_position={"BTC": "1000", "ETH": "1000"})
+    s.open_account("counter", cash="100000",
+                   max_position={"BTC": "1000", "ETH": "1000"})
+    s.register_symbol("BTC")
+    s.register_symbol("ETH")
+    s.deposit("trader", symbol="BTC", quantity="50")
+    s.deposit("counter", symbol="BTC", quantity="1000")
+    return s
+
+
+def test_projected_cash_includes_open_sell_proceeds(dual):
+    """同一账户同时挂在途买单与卖单：预计现金与预计持仓同一口径
+    （都假设在途订单全部按各自委托价成交）。"""
+    logger.info("INPUT: trader cash=2000 BTC=50; buy 4 BTC@100, sell 10 BTC@200, "
+                "buy 2 ETH@50（价格不交叉，全部只挂单）")
+    b1 = dual.submit_order("d1", "BTC", Side.BUY, "100", "4", "trader")   # 付 400
+    s1 = dual.submit_order("d2", "BTC", Side.SELL, "200", "10", "trader")  # 收 2000
+    b2 = dual.submit_order("d3", "ETH", Side.BUY, "50", "2", "trader")    # 付 100
+    assert b1.status == s1.status == b2.status == OrderStatus.NEW
+    assert dual.get_fills() == []  # 买价 < 卖价，不发生自成交
+
+    snap = dual.risk_snapshot("trader")
+    logger.info("STATE: cash=%s reserved_buy=%s reserved_sell=%s available=%s "
+                "projected=%s", snap.cash, snap.reserved_buy_notional,
+                snap.reserved_sell_notional, snap.available_cash,
+                snap.projected_cash)
+    # 判定依据：预计现金 = 现有现金 − 在途买单应付 + 在途卖单可收
+    assert snap.cash == 2000
+    assert snap.reserved_buy_notional == 500        # 400 + 100，跨品种共享
+    assert snap.reserved_sell_notional == 2000      # 10@200
+    assert snap.available_cash == 1500
+    assert snap.projected_cash == 2000 - 500 + 2000 == 3500
+    # 恒等式：projected_cash == cash - 买占用 + 卖回款
+    assert snap.projected_cash == snap.cash - snap.reserved_buy_notional \
+        + snap.reserved_sell_notional
+    # 同口径的预计持仓：BTC 50 + 4(在途买) − 10(在途卖) = 44
+    btc = snap.positions["BTC"]
+    assert btc.position == 50 and btc.projected_position == 44
+    assert btc.reserved_sell == 10 and btc.available_position == 40
+    assert snap.positions["ETH"].projected_position == 2
+    # 无任何违约标志
+    assert snap.cash_limit_breached is False
+    assert snap.projected_cash_limit_breached is False
+    assert snap.any_breach is False
+
+
+def test_projected_values_track_partial_fill_cancel_and_reject(dual):
+    """部分成交只释放已成交占用、撤单立即释放、拒单零占用，
+    预计现金/预计持仓始终跟随订单簿与账户真实状态。"""
+    buy = dual.submit_order("e1", "BTC", Side.BUY, "100", "10", "trader")  # 1000
+    sell = dual.submit_order("e2", "BTC", Side.SELL, "150", "5", "trader")  # 750
+    assert buy.status == sell.status == OrderStatus.NEW
+    snap = dual.risk_snapshot("trader")
+    assert snap.projected_cash == 2000 - 1000 + 750 == 1750
+    assert snap.positions["BTC"].projected_position == 50 + 10 - 5 == 55
+
+    # 部分成交 4@100：已成交部分转为真实划转，占用只保留剩余 6*100=600
+    dual.submit_order("e3", "BTC", Side.SELL, "100", "4", "counter")
+    snap = dual.risk_snapshot("trader")
+    logger.info("STATE: partial fill 4 -> cash=%s reserved_buy=%s projected=%s",
+                snap.cash, snap.reserved_buy_notional, snap.projected_cash)
+    assert snap.cash == 1600                       # 真实划出 4*100
+    assert snap.reserved_buy_notional == 600       # 只剩 6 口占用
+    assert snap.reserved_sell_notional == 750      # 卖单未动
+    assert snap.projected_cash == 1600 - 600 + 750 == 1750  # 与成交前一致
+    assert snap.positions["BTC"].position == 54
+    assert snap.positions["BTC"].projected_position == 55   # 54 + 6 - 5
+
+    # 撤掉在途卖单：750 回款立即从预计现金中释放
+    dual.cancel_order(sell.order_id)
+    snap = dual.risk_snapshot("trader")
+    logger.info("STATE: cancel sell -> reserved_sell=%s projected=%s",
+                snap.reserved_sell_notional, snap.projected_cash)
+    assert snap.reserved_sell_notional == 0
+    assert snap.projected_cash == 1600 - 600 == 1000
+    assert snap.positions["BTC"].projected_position == 54 + 6 == 60
+
+    # 拒单零占用：可用现金 1000，买 20@100=2000 被拒，快照不变
+    before = dual.risk_snapshot("trader")
+    rejected = dual.submit_order("e4", "BTC", Side.BUY, "100", "20", "trader")
+    assert rejected.status == OrderStatus.REJECTED
+    assert rejected.reject_reason == RejectReason.INSUFFICIENT_CASH
+    after = dual.risk_snapshot("trader")
+    assert (after.projected_cash, after.reserved_buy_notional,
+            after.reserved_sell_notional) == (before.projected_cash,
+                                              before.reserved_buy_notional,
+                                              before.reserved_sell_notional)
+    assert after.positions["BTC"].projected_position == \
+        before.positions["BTC"].projected_position
+
+    # 剩余 6 口全部成交后：占用归零，预计值收敛到当前值
+    dual.submit_order("e5", "BTC", Side.SELL, "100", "6", "counter")
+    snap = dual.risk_snapshot("trader")
+    assert snap.reserved_buy_notional == 0 and snap.reserved_sell_notional == 0
+    assert snap.cash == 1000
+    assert snap.projected_cash == snap.cash == snap.available_cash
+    assert snap.positions["BTC"].position == 60
+    assert snap.positions["BTC"].projected_position == 60
+    logger.info("JUDGEMENT: projected cash/position track real state through "
+                "partial fill, cancel and reject")
+
+
 # ============ 并发下的占用与快照一致性 ============
 def test_concurrent_submits_and_cancels_snapshot_consistency(tmp_path):
     """并发下单 + 并发撤单交错进行：任一时点占用不得重复、快照恒为一致状态。"""
@@ -293,12 +402,114 @@ def test_concurrent_buys_cash_pool_never_oversubscribed(tmp_path):
     assert svc.get_fills() == []
 
 
+def test_concurrent_mixed_orders_snapshot_identities(tmp_path):
+    """同一账户并发双向挂单 + 并发撤单 + 限额收紧交错：
+    任一时点快照都必须满足口径恒等式，看不到中间态、不重复占用。"""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    from app.eventlog import EventLog
+    from app.service import TradingService
+
+    svc = TradingService(EventLog(tmp_path / "mixed.jsonl"))
+    svc.open_account("trader", cash="100000",
+                     max_position={"BTC": "100000", "ETH": "100000"})
+    svc.register_symbol("BTC")
+    svc.register_symbol("ETH")
+    # 每品种入券 1000：足够 50 笔卖单（各 10）占用；持仓远低于限额，
+    # 避免限额收紧线程把新单误拒
+    svc.deposit("trader", symbol="BTC", quantity="1000")
+    svc.deposit("trader", symbol="ETH", quantity="1000")
+
+    symbols = ["BTC", "ETH"]
+    stop = threading.Event()
+    errors: list[Exception] = []
+
+    def submit(i: int):
+        sym = symbols[i % 2]
+        if i % 4 < 2:
+            # 买单 @10：与卖单 @20 不交叉，全部只挂单
+            return svc.submit_order(f"mb{i}", sym, Side.BUY, "10", "10", "trader")
+        return svc.submit_order(f"ms{i}", sym, Side.SELL, "20", "10", "trader")
+
+    def cancel(ids):
+        for oid in ids:
+            try:
+                svc.cancel_order(oid)
+            except Exception:
+                pass  # 与重复撤单竞争时允许业务拒绝
+
+    def tighten():
+        # 并发收紧/放宽限额（2000 仍高于最大预计持仓 1500，不会误拒新单）：
+        # 只影响违约标志，不得破坏快照恒等式
+        while not stop.is_set():
+            svc.adjust_limits("trader", max_position={"BTC": "2000"})
+            svc.adjust_limits("trader", max_position={"BTC": "100000"})
+
+    def observer():
+        while not stop.is_set():
+            try:
+                snap = svc.risk_snapshot("trader")
+                # 口径恒等式 1：可用现金 = 现金 − 在途买单占用
+                if snap.available_cash != snap.cash - snap.reserved_buy_notional:
+                    raise AssertionError("available cash identity broken")
+                # 口径恒等式 2：预计现金 = 现金 − 买占用 + 卖回款
+                if snap.projected_cash != snap.cash - snap.reserved_buy_notional \
+                        + snap.reserved_sell_notional:
+                    raise AssertionError("projected cash identity broken")
+                # 口径恒等式 3：分品种可用持仓 = 持仓 − 在途卖占用
+                for view in snap.positions.values():
+                    if view.available_position != view.position - view.reserved_sell:
+                        raise AssertionError(
+                            f"{view.symbol} available position identity broken")
+                # 占用不为负、不超额（无重复占用）
+                if snap.reserved_buy_notional < 0 or snap.reserved_sell_notional < 0:
+                    raise AssertionError("negative reservation")
+                if snap.reserved_buy_notional > 100000 \
+                        or snap.reserved_sell_notional > 20000:
+                    raise AssertionError("reservation oversubscribed")
+                # 违约标志必须与预计值同口径：负现金 ⇔ 标志置位
+                if (snap.projected_cash < 0) != snap.projected_cash_limit_breached:
+                    raise AssertionError("projected cash breach flag inconsistent")
+                if (snap.cash < 0) != snap.cash_limit_breached:
+                    raise AssertionError("cash breach flag inconsistent")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+    with ThreadPoolExecutor(max_workers=20) as pool:
+        obs = [pool.submit(observer) for _ in range(4)]
+        adj = [pool.submit(tighten) for _ in range(2)]
+        orders = list(pool.map(submit, range(200)))
+        accepted = [o for o in orders if o.status in
+                    (OrderStatus.NEW, OrderStatus.PARTIALLY_FILLED)]
+        # 100 笔买（各 100）+ 100 笔卖（各 10 持仓）：资金/持仓充足，全部接受
+        assert len(accepted) == 200
+        ids = [o.order_id for o in accepted]
+        halves = [ids[:100], ids[100:]]
+        list(pool.map(cancel, halves))
+        stop.set()
+        for f in obs + adj:
+            f.result()
+
+    assert errors == []
+    snap = svc.risk_snapshot("trader")
+    logger.info("STATE: after mixed concurrent cancels reserved_buy=%s "
+                "reserved_sell=%s projected=%s", snap.reserved_buy_notional,
+                snap.reserved_sell_notional, snap.projected_cash)
+    # 全部撤完：占用归零，预计值收敛到当前值（无成交）
+    assert snap.reserved_buy_notional == 0
+    assert snap.reserved_sell_notional == 0
+    assert snap.projected_cash == snap.cash == 100000
+    assert svc.get_fills() == []
+
+
 # ============ 重启重放：占用、快照与限额调整保持一致 ============
 def _snapshot_dict(svc, account="buyer"):
     snap = svc.risk_snapshot(account)
     return {
         "cash": str(snap.cash),
         "reserved_buy_notional": str(snap.reserved_buy_notional),
+        "reserved_sell_notional": str(snap.reserved_sell_notional),
         "available_cash": str(snap.available_cash),
         "projected_cash": str(snap.projected_cash),
         "max_order_notional": str(snap.max_order_notional),
@@ -400,6 +611,63 @@ def test_portfolio_state_identical_after_restart(tmp_path):
     blocked = svc2.submit_order("m7", "BTC", Side.BUY, "100", "1", "buyer")
     assert blocked.status == OrderStatus.REJECTED
     assert blocked.reject_reason == RejectReason.RISK_LIMIT_EXCEEDED
+
+
+def test_mixed_direction_snapshot_identical_after_restart(tmp_path):
+    """同一账户同时持有在途买单与卖单：修正后的预计现金/预计持仓、
+    限额违约标志在重启重放后与停机前逐字段一致。"""
+    from app.eventlog import EventLog
+    from app.service import TradingService
+
+    path = tmp_path / "mixed-replay.jsonl"
+    svc = TradingService(EventLog(path))
+    svc.open_account("trader", cash="5000",
+                     max_position={"BTC": "1000", "ETH": "1000"})
+    svc.open_account("counter", cash="100000",
+                     max_position={"BTC": "1000", "ETH": "1000"})
+    svc.register_symbol("BTC")
+    svc.register_symbol("ETH")
+    svc.deposit("trader", symbol="BTC", quantity="40")
+    svc.deposit("counter", symbol="BTC", quantity="1000")
+
+    # 双向在途：买 10@100（付 1000）、卖 5@200（收 1000），价格不交叉
+    svc.submit_order("r1", "BTC", Side.BUY, "100", "10", "trader")
+    svc.submit_order("r2", "BTC", Side.SELL, "200", "5", "trader")
+    # 部分成交 3@100：现金真实划出 300，买单占用只剩 7*100=700
+    svc.submit_order("r3", "BTC", Side.SELL, "100", "3", "counter")
+    # 收紧 BTC 限额到 40：当前持仓 43 已超限，预计 45 也超限
+    svc.adjust_limits("trader", max_position={"BTC": "40"})
+    svc._log.close()
+
+    before = _snapshot_dict(svc, "trader")
+    logger.info("MIXED SNAPSHOT BEFORE RESTART: %s", before)
+    # 修正口径：预计现金 = 4700 − 700(在途买) + 1000(在途卖) = 5000
+    assert before["cash"] == "4700"
+    assert before["reserved_buy_notional"] == "700"
+    assert before["reserved_sell_notional"] == "1000"
+    assert before["available_cash"] == "4000"
+    assert before["projected_cash"] == "5000"
+    btc = before["positions"]["BTC"]
+    assert btc["position"] == "43" and btc["projected_position"] == "45"
+    assert btc["position_limit_breached"] is True
+    assert btc["projected_position_limit_breached"] is True
+    assert before["any_breach"] is True
+
+    svc2 = TradingService(EventLog(path))
+    svc2.replay()
+    after = _snapshot_dict(svc2, "trader")
+    logger.info("MIXED SNAPSHOT AFTER RESTART: %s", after)
+    assert before == after
+
+    # 重放后限额行为一致：新买单预计持仓 43+7+1-5=46 > 40，仍被拒且零副作用
+    blocked = svc2.submit_order("r4", "BTC", Side.BUY, "100", "1", "trader")
+    assert blocked.status == OrderStatus.REJECTED
+    assert blocked.reject_reason == RejectReason.RISK_LIMIT_EXCEEDED
+    still = _snapshot_dict(svc2, "trader")
+    assert still["projected_cash"] == "5000"
+    assert still["positions"]["BTC"]["projected_position"] == "45"
+    logger.info("JUDGEMENT: mixed-direction projected values and limit "
+                "behaviour identical after replay")
 
 
 def test_http_risk_snapshot_and_limit_adjustment(tmp_path):

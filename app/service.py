@@ -401,7 +401,9 @@ class TradingService:
 
         - 现金占用汇总该账户**所有品种**的在途买单（剩余量×委托价）；
         - 卖单占用按品种分别汇总；部分成交后剩余量自动减少，占用随之释放；
-        - 预计持仓/现金按各在途订单的委托价全部成交估算；
+        - 预计持仓/现金按各在途订单的委托价全部成交估算：预计现金 =
+          当前现金 − 在途买单应付名义额 + 在途卖单可收名义额，
+          与预计持仓（在途买卖单全部成交）保持同一口径；
         - 明确标出当前与预计是否触及限额，包括收紧限额后存量在途单的违约。
         """
         with self._lock:
@@ -411,6 +413,7 @@ class TradingService:
                                    f"account {account_id} not found")
 
             reserved_buy_notional = ZERO
+            reserved_sell_notional = ZERO
             buy_qty: dict[str, Decimal] = {}
             sell_qty: dict[str, Decimal] = {}
             notional_breaches: list[str] = []
@@ -423,13 +426,15 @@ class TradingService:
                     buy_qty[active.symbol] = buy_qty.get(active.symbol, ZERO) \
                         + active.remaining
                 else:
+                    reserved_sell_notional += notional
                     sell_qty[active.symbol] = sell_qty.get(active.symbol, ZERO) \
                         + active.remaining
                 if notional > acc.max_order_notional:
                     notional_breaches.append(active.order_id)
 
             available_cash = acc.cash - reserved_buy_notional
-            projected_cash = available_cash  # 买单全部成交后现金
+            # 在途订单全部按委托价成交后的现金：付出去买单的钱、收回来卖单的钱
+            projected_cash = available_cash + reserved_sell_notional
             cash_breach = acc.cash < 0
             projected_cash_breach = projected_cash < 0
 
@@ -464,6 +469,7 @@ class TradingService:
                 account_id=account_id,
                 cash=acc.cash,
                 reserved_buy_notional=reserved_buy_notional,
+                reserved_sell_notional=reserved_sell_notional,
                 available_cash=available_cash,
                 projected_cash=projected_cash,
                 positions=views,

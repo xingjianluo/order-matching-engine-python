@@ -136,12 +136,13 @@ curl -s -X POST localhost:8000/admin/accounts/buyer/limits \
 | 字段 | 含义 |
 | --- | --- |
 | `cash` | 当前现金（已成交部分已扣划） |
-| `reserved_buy_notional` | 跨**所有品种**在途买单的名义额占用合计 |
+| `reserved_buy_notional` | 跨**所有品种**在途买单的名义额占用合计（剩余量 × 委托价） |
+| `reserved_sell_notional` | 跨**所有品种**在途卖单全部成交可收回的名义额合计（剩余量 × 委托价） |
 | `available_cash` | 可用现金 = `cash − reserved_buy_notional` |
-| `projected_cash` | 所有在途买单按各自委托价全部成交后的现金（= `available_cash`） |
+| `projected_cash` | **所有在途订单**（买单与卖单）按各自委托价**全部成交后**的现金 = `cash − reserved_buy_notional + reserved_sell_notional` |
 | `max_order_notional` | 单笔名义额上限 |
 | `order_notional_breaches` | 当前名义额超过单笔上限的在途订单 id（限额收紧后可能出现） |
-| `cash_limit_breached` / `projected_cash_limit_breached` | 当前/在途全成交后现金是否为负 |
+| `cash_limit_breached` / `projected_cash_limit_breached` | 当前现金 / 在途订单全部成交后的预计现金是否为负 |
 | `any_breach` | 下列任一当前或预计违约标志为真 |
 
 各品种（`positions[]`，覆盖全部已注册品种及有持仓/挂单/限额的品种）：
@@ -152,9 +153,16 @@ curl -s -X POST localhost:8000/admin/accounts/buyer/limits \
 | `reserved_sell` | 该品种在途卖单占用的数量 |
 | `available_position` | 可卖数量 = `position − reserved_sell` |
 | `max_position` | 该品种净持仓绝对值上限，`null` 表示不限 |
-| `projected_position` | 该品种在途买卖单全部成交后的净持仓 |
+| `projected_position` | 该品种**所有在途订单**（买单与卖单）**全部成交后**的净持仓 = `position + 在途买单剩余量 − 在途卖单剩余量` |
 | `position_limit_breached` | 当前 `|position|` 是否已超限 |
 | `projected_position_limit_breached` | 在途订单全部成交后是否超限 |
+
+`projected_cash` 与 `projected_position` 是**同一口径**的两个预计值：都表示
+“当前全部在途订单按各自委托价成交完毕之后”的账户状态——预计现金减去买单要
+支付的、加上卖单可收回的名义额，预计持仓加上在途买单、减去在途卖单的数量。
+两者都基于订单**剩余量**计算，因此部分成交只释放已成交部分、撤单立即释放、
+拒单从不产生占用，预计值始终跟随订单簿与账户的真实状态；现金/持仓的
+“当前是否超限 / 预计是否超限”标志也都基于这两个口径判定。
 
 ## 动态限额及其生效边界
 
@@ -227,22 +235,26 @@ fsync 落盘，再更新内存状态**。因此不会出现“内存已成交而
 ## 本地验证
 
 ```bash
-uv run pytest -q                 # 全部 39 个用例
-uv run pytest tests/test_risk_portfolio.py -q   # 仅本轮组合风险相关用例
+uv run pytest -q                 # 全部 43 个用例
+uv run pytest tests/test_risk_portfolio.py -q   # 仅组合风险相关用例
 ```
 
 测试分四组，且通过日志（stdout/stderr）打印**输入参数、关键状态快照与判定依据**：
 
 - `tests/test_matching.py`：全部/部分成交、价格-时间优先、不成交挂单、
   撤单与重复撤单、自成交、资金/持仓不足、非法输入与守恒断言。
-- `tests/test_risk_portfolio.py`（本轮新增）：
+- `tests/test_risk_portfolio.py`（组合风险）：
   - 同一账户跨品种在途买单共享同一份现金（超池拒绝、被拒零副作用）；
   - 同品种在途卖单共同占用可用持仓、不同品种互不影响；
+  - 同一账户同时挂在途买单与卖单时，预计现金（含卖单回款）与预计持仓
+    口径一致，且部分成交/撤单/拒单后预计值跟随真实状态；
   - 运行中收紧持仓限额/单笔名义额：存量单不撤、快照标出预计违约、
     后续新单被整单拒绝且订单簿/成交/账户零副作用；
   - 撤单与部分成交只释放对应占用（已成交部分转为真实划转，剩余继续占用）；
   - 16 线程并发下单 + 并发撤单交错下快照恒等式成立、现金池不超额订阅；
-  - 跨“进程”重启重放后风险快照、订单簿、成交、限额调整逐字段一致，
+    双向挂单 + 限额收紧并发交错下预计现金/可用持仓恒等式与违约标志始终自洽；
+  - 跨“进程”重启重放后风险快照（含双向挂单的预计现金/持仓与违约标志）、
+    订单簿、成交、限额调整逐字段一致，
     并经 FastAPI TestClient 验证新 HTTP 端点的持久化。
 - `tests/test_concurrency.py`：16 线程下撤单与成交竞争（只允许一方生效）、
   100 个并发买单不得超卖 10 的挂量、同一幂等键 50 并发只成交一次、

@@ -116,13 +116,16 @@ class AccountRiskSnapshot:
     account_id: str
     cash: Decimal                        # 当前现金
     reserved_buy_notional: Decimal       # 跨品种全部在途买单占用名义额
+    reserved_sell_notional: Decimal      # 跨品种全部在途卖单成交可收名义额
     available_cash: Decimal              # 可用现金 = cash - reserved_buy_notional
-    projected_cash: Decimal              # 在途买单全部成交后的现金
+    # 在途订单全部按各自委托价成交后的现金：
+    # cash - reserved_buy_notional + reserved_sell_notional
+    projected_cash: Decimal
     positions: dict[str, PositionRiskView]
     # 单笔名义额上限
     max_order_notional: Decimal
     # 超过单笔名义额上限的在途订单（限额收紧后可能出现）
     order_notional_breaches: list[str] = field(default_factory=list)
     cash_limit_breached: bool = False            # 当前现金是否为负
-    projected_cash_limit_breached: bool = False  # 在途买单全部成交后现金是否为负
+    projected_cash_limit_breached: bool = False  # 在途订单全部成交后现金是否为负
     any_breach: bool = False                     # 上述任一当前/预计违约标志
